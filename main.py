@@ -63,10 +63,12 @@ if ROBLOX_COOKIE.lower().startswith(".roblosecurity="):
     ROBLOX_COOKIE = ROBLOX_COOKIE.split("=", 1)[1]
 
 OWNER_ID = env_int("OWNER_ID")
-TICKET_CATEGORY_ID = env_int("TICKET_CATEGORY_ID", 1507716131551707258)   # the category the tickets are made in
+# the categories the tickets are made in (comma separated in .env)
+TICKET_CATEGORY_IDS = [int(x) for x in re.findall(r"\d+", os.getenv("TICKET_CATEGORY_IDS", "")
+                       or "1507716131551707258,1570834279242530836")]
 TRACKED_BOT_ID = env_int("TRACKED_BOT_ID", 1470577242676531372)           # the bot whose messages are read
 RESULT_CHANNEL_ID = env_int("RESULT_CHANNEL_ID", 1562782174137159792)     # a result posted here = the backup ended
-WARN_CHANNEL_ID = env_int("WARN_CHANNEL_ID", 0)                           # 0 = post warnings inside the ticket
+WARN_CHANNEL_ID = env_int("WARN_CHANNEL_ID", 1570849070753251348)         # all warnings are posted here (0 = inside the ticket)
 
 OFFLINE_MINUTES = env_int("OFFLINE_MINUTES", 5)
 NOT_JOINED_MINUTES = env_int("NOT_JOINED_MINUTES", 7)
@@ -440,7 +442,7 @@ async def poll_loop():
 
 # ============================================================ discord side
 def in_tickets(channel) -> bool:
-    return getattr(channel, "category_id", None) == TICKET_CATEGORY_ID
+    return getattr(channel, "category_id", None) in TICKET_CATEGORY_IDS
 
 
 def find_ticket(text: str):
@@ -545,10 +547,11 @@ client = Cruxer()
 
 async def recover():
     """After a restart: pick up tickets and helper messages that were posted while the bot was off."""
-    cat = client.get_channel(TICKET_CATEGORY_ID)
-    if not isinstance(cat, discord.CategoryChannel):
-        print("Ticket category not found. Check TICKET_CATEGORY_ID and that the bot can see it.")
+    cats = [c for c in (client.get_channel(i) for i in TICKET_CATEGORY_IDS) if isinstance(c, discord.CategoryChannel)]
+    if not cats:
+        print("No ticket category found. Check TICKET_CATEGORY_IDS and that the bot can see them.")
         return
+    channels = [ch for c in cats for ch in c.text_channels]
     ended = set()
     rchan = client.get_channel(RESULT_CHANNEL_ID)
     if rchan:
@@ -563,7 +566,7 @@ async def recover():
             await end_ticket(t, silent=True)
     cutoff = time.time() - RECOVER_HOURS * 3600
     found = 0
-    for chan in cat.text_channels:
+    for chan in channels:
         if str(chan.id) in state["tickets"] or ticket_number(chan.name) in ended:
             continue
         if chan.created_at.timestamp() < cutoff:
@@ -674,11 +677,12 @@ async def test_cmd(interaction: discord.Interaction):
     data = await client.roblox.presence([1])
     lines.append(f"{'✅' if data else '❌'} Roblox presence API: " + ("working" if data else "no answer"))
 
-    cat = client.get_channel(TICKET_CATEGORY_ID)
-    if isinstance(cat, discord.CategoryChannel):
-        lines.append(f"✅ Ticket category: **{cat.name}** ({len(cat.text_channels)} channels)")
-    else:
-        lines.append("❌ Ticket category not found (check TICKET_CATEGORY_ID and bot access)")
+    for cid in TICKET_CATEGORY_IDS:
+        cat = client.get_channel(cid)
+        if isinstance(cat, discord.CategoryChannel):
+            lines.append(f"✅ Ticket category: **{cat.name}** ({len(cat.text_channels)} channels)")
+        else:
+            lines.append(f"❌ Ticket category `{cid}` not found (check the ID and bot access)")
 
     rch = client.get_channel(RESULT_CHANNEL_ID)
     if rch:
@@ -689,8 +693,14 @@ async def test_cmd(interaction: discord.Interaction):
 
     if WARN_CHANNEL_ID:
         wch = client.get_channel(WARN_CHANNEL_ID)
-        ok = bool(wch and wch.permissions_for(wch.guild.me).send_messages)
-        lines.append(f"{'✅' if ok else '❌'} Warning channel: " + (wch.mention if wch else "not found"))
+        if not wch:
+            lines.append(f"❌ Warning channel `{WARN_CHANNEL_ID}` not found (check the ID and bot access)")
+        else:
+            perms = wch.permissions_for(wch.guild.me)
+            missing = [n for n, ok in (("view channel", perms.view_channel), ("send messages", perms.send_messages),
+                                       ("embed links", perms.embed_links)) if not ok]
+            lines.append(f"{'✅' if not missing else '❌'} Warning channel: {wch.mention}"
+                         + (f" (missing: {', '.join(missing)})" if missing else ""))
     else:
         lines.append("✅ Warnings are posted inside each ticket")
 
@@ -819,7 +829,7 @@ async def config_cmd(interaction: discord.Interaction):
     await interaction.response.send_message(
         f"Offline warning: `{OFFLINE_MINUTES}` min\nNot-in-game warning: `{NOT_JOINED_MINUTES}` min\n"
         f"Warning limit: `{MAX_WARNINGS}`\nPoll every: `{POLL_SECONDS}`s\n"
-        f"Ticket category: `{TICKET_CATEGORY_ID}`\nTracked bot: `{TRACKED_BOT_ID}`\n"
+        f"Ticket categories: {", ".join(f"`{i}`" for i in TICKET_CATEGORY_IDS)}\nTracked bot: `{TRACKED_BOT_ID}`\n"
         f"Result channel: `{RESULT_CHANNEL_ID}`\nWarn channel: `{WARN_CHANNEL_ID or 'inside the ticket'}`",
         ephemeral=True)
 
