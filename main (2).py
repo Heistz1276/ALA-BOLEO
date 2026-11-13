@@ -630,6 +630,200 @@ async def resetwarnings_cmd(interaction: discord.Interaction, member: discord.Us
                                             allowed_mentions=NO_PING)
 
 
+def open_tickets():
+    return [t for t in state["tickets"].values() if not t["ended"]]
+
+
+def helper_status(h) -> str:
+    if h["seen_game"]:
+        return "✅ in the game"
+    if h.get("wend"):
+        return "⛔ never joined"
+    if h["seen_online"]:
+        return "🟡 online, not in the server"
+    return "🔴 offline"
+
+
+def mins_ago(ts: float) -> int:
+    return max(0, int((time.time() - ts) / 60))
+
+
+@client.tree.command(name="ping", description="Check that the bot is alive and how fast Roblox answers.")
+async def ping_cmd(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    t0 = time.perf_counter()
+    who = await client.roblox.whoami()
+    rb_ms = int((time.perf_counter() - t0) * 1000)
+    roblox_line = (f"Roblox: `{rb_ms}ms`, cookie logged in as **{who}**" if who
+                   else "Roblox: cookie rejected or Roblox unreachable")
+    await interaction.followup.send(
+        f"🏓 Pong!\nDiscord: `{int(client.latency * 1000)}ms`\n{roblox_line}\n"
+        f"Open tickets: `{len(open_tickets())}`", ephemeral=True)
+
+
+@client.tree.command(name="test", description="Admin only: run a full self-check of the bot's setup.")
+async def test_cmd(interaction: discord.Interaction):
+    if not allowed(interaction):
+        return await interaction.response.send_message("Admins only.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    lines = []
+
+    who = await client.roblox.whoami()
+    lines.append(f"{'✅' if who else '❌'} Roblox cookie: " + (f"logged in as **{who}**" if who else "rejected or expired"))
+
+    data = await client.roblox.presence([1])
+    lines.append(f"{'✅' if data else '❌'} Roblox presence API: " + ("working" if data else "no answer"))
+
+    cat = client.get_channel(TICKET_CATEGORY_ID)
+    if isinstance(cat, discord.CategoryChannel):
+        lines.append(f"✅ Ticket category: **{cat.name}** ({len(cat.text_channels)} channels)")
+    else:
+        lines.append("❌ Ticket category not found (check TICKET_CATEGORY_ID and bot access)")
+
+    rch = client.get_channel(RESULT_CHANNEL_ID)
+    if rch:
+        ok = rch.permissions_for(rch.guild.me).read_message_history
+        lines.append(f"{'✅' if ok else '⚠️'} Result channel: {rch.mention}" + ("" if ok else " (cannot read history)"))
+    else:
+        lines.append("❌ Result channel not found (check RESULT_CHANNEL_ID)")
+
+    if WARN_CHANNEL_ID:
+        wch = client.get_channel(WARN_CHANNEL_ID)
+        ok = bool(wch and wch.permissions_for(wch.guild.me).send_messages)
+        lines.append(f"{'✅' if ok else '❌'} Warning channel: " + (wch.mention if wch else "not found"))
+    else:
+        lines.append("✅ Warnings are posted inside each ticket")
+
+    lines.append(f"{'✅' if client.intents.message_content else '❌'} Message content intent requested")
+    lines.append(f"ℹ️ Tracked bot: <@{TRACKED_BOT_ID}> | Open tickets: `{len(open_tickets())}` | "
+                 f"Poll loop: {'running' if poll_loop.is_running() else 'STOPPED'}")
+    await interaction.followup.send("\n".join(lines), ephemeral=True, allowed_mentions=NO_PING)
+
+
+@client.tree.command(name="testwarn", description="Admin only: post a sample warning here (does not count).")
+async def testwarn_cmd(interaction: discord.Interaction):
+    if not allowed(interaction):
+        return await interaction.response.send_message("Admins only.", ephemeral=True)
+    yellow = discord.Embed(
+        title="Helper Warning",
+        description=f"Member: {interaction.user.mention}\nTicket: {TICKET_LABEL} #0001\n"
+                    f"Reason: Offline on Roblox (TEST)\nWarnings: `0/{MAX_WARNINGS}`.",
+        colour=YELLOW)
+    yellow.set_footer(text=BOT_NAME)
+    red = discord.Embed(
+        title=f"Offline Helper Warning - {TICKET_LABEL} #0001",
+        description="These helpers joined this backup but were still not in the game when it ended:\n"
+                    f"• {interaction.user.mention} – [TestUser](https://www.roblox.com/users/1/profile) "
+                    "was offline, not in the requested server",
+        colour=RED)
+    red.set_footer(text=BOT_NAME)
+    await interaction.response.send_message("Sample embeds (no warning was added):", ephemeral=True)
+    await interaction.channel.send(embeds=[yellow, red], allowed_mentions=NO_PING)
+
+
+@client.tree.command(name="status", description="Admin only: show open tickets and their helpers.")
+async def status_cmd(interaction: discord.Interaction):
+    if not allowed(interaction):
+        return await interaction.response.send_message("Admins only.", ephemeral=True)
+    tks = open_tickets()
+    if not tks:
+        return await interaction.response.send_message("No open tickets are being watched.", ephemeral=True)
+    lines = []
+    for t in sorted(tks, key=lambda x: x["created"]):
+        total = len(t["helpers"])
+        ingame = sum(1 for h in t["helpers"].values() if h["seen_game"])
+        lines.append(f"**{label(t)}** <#{t['channel_id']}> – open {mins_ago(t['created'])}m, "
+                     f"helpers `{total}`, in game `{ingame}`")
+    await interaction.response.send_message("\n".join(lines)[:1900], ephemeral=True, allowed_mentions=NO_PING)
+
+
+@client.tree.command(name="helpers", description="Admin only: list the helpers of a ticket and their live status.")
+@app_commands.describe(number="Ticket number (default: the ticket you run this in)")
+async def helpers_cmd(interaction: discord.Interaction, number: int = None):
+    if not allowed(interaction):
+        return await interaction.response.send_message("Admins only.", ephemeral=True)
+    t = None
+    if number is not None:
+        found = [x for x in state["tickets"].values() if x.get("number") == number]
+        t = max(found, key=lambda x: x["created"]) if found else None
+    else:
+        t = state["tickets"].get(str(interaction.channel_id))
+    if not t:
+        return await interaction.response.send_message("Ticket not found. Give a ticket number.", ephemeral=True)
+    if not t["helpers"]:
+        return await interaction.response.send_message(f"{label(t)} has no registered helpers yet.", ephemeral=True)
+    lines = [f"**{label(t)}** – {'ended' if t['ended'] else 'open'}"]
+    for h in t["helpers"].values():
+        lines.append(f"<@{h['discord_id']}> – `{h['roblox']}` – {helper_status(h)} – registered {mins_ago(h['t'])}m ago")
+    await interaction.response.send_message("\n".join(lines)[:1900], ephemeral=True, allowed_mentions=NO_PING)
+
+
+@client.tree.command(name="topwarnings", description="Show the members with the most helper warnings.")
+async def topwarnings_cmd(interaction: discord.Interaction):
+    ranked = sorted(((int(u), c) for u, c in state["warnings"].items() if c > 0), key=lambda x: -x[1])[:10]
+    if not ranked:
+        return await interaction.response.send_message("Nobody has any warnings.", ephemeral=True)
+    lines = [f"`{i}.` <@{u}> – `{c}/{MAX_WARNINGS}`" for i, (u, c) in enumerate(ranked, 1)]
+    await interaction.response.send_message("**Most warnings**\n" + "\n".join(lines),
+                                            ephemeral=True, allowed_mentions=NO_PING)
+
+
+@client.tree.command(name="setwarnings", description="Admin only: set a member's warning count.")
+@app_commands.describe(member="Member", amount="New warning count")
+async def setwarnings_cmd(interaction: discord.Interaction, member: discord.User, amount: app_commands.Range[int, 0, 100]):
+    if not allowed(interaction):
+        return await interaction.response.send_message("Admins only.", ephemeral=True)
+    if amount:
+        state["warnings"][str(member.id)] = amount
+    else:
+        state["warnings"].pop(str(member.id), None)
+    save()
+    await interaction.response.send_message(f"{member.mention} now has `{amount}/{MAX_WARNINGS}` warnings.",
+                                            ephemeral=True, allowed_mentions=NO_PING)
+
+
+@client.tree.command(name="removewarning", description="Admin only: remove warnings from a member (a wrongly given one).")
+@app_commands.describe(member="Member", amount="How many to remove (default 1)")
+async def removewarning_cmd(interaction: discord.Interaction, member: discord.User,
+                            amount: app_commands.Range[int, 1, 100] = 1):
+    if not allowed(interaction):
+        return await interaction.response.send_message("Admins only.", ephemeral=True)
+    new = max(0, state["warnings"].get(str(member.id), 0) - amount)
+    if new:
+        state["warnings"][str(member.id)] = new
+    else:
+        state["warnings"].pop(str(member.id), None)
+    save()
+    await interaction.response.send_message(f"{member.mention} now has `{new}/{MAX_WARNINGS}` warnings.",
+                                            ephemeral=True, allowed_mentions=NO_PING)
+
+
+@client.tree.command(name="endticket", description="Admin only: end a ticket now (final check + warnings), like a result was posted.")
+@app_commands.describe(number="Ticket number")
+async def endticket_cmd(interaction: discord.Interaction, number: int):
+    if not allowed(interaction):
+        return await interaction.response.send_message("Admins only.", ephemeral=True)
+    found = [t for t in open_tickets() if t.get("number") == number]
+    if not found:
+        return await interaction.response.send_message("No open ticket with that number.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    t = max(found, key=lambda x: x["created"])
+    await end_ticket(t)
+    await interaction.followup.send(f"{label(t)} was ended.", ephemeral=True)
+
+
+@client.tree.command(name="config", description="Admin only: show the bot's current settings.")
+async def config_cmd(interaction: discord.Interaction):
+    if not allowed(interaction):
+        return await interaction.response.send_message("Admins only.", ephemeral=True)
+    await interaction.response.send_message(
+        f"Offline warning: `{OFFLINE_MINUTES}` min\nNot-in-game warning: `{NOT_JOINED_MINUTES}` min\n"
+        f"Warning limit: `{MAX_WARNINGS}`\nPoll every: `{POLL_SECONDS}`s\n"
+        f"Ticket category: `{TICKET_CATEGORY_ID}`\nTracked bot: `{TRACKED_BOT_ID}`\n"
+        f"Result channel: `{RESULT_CHANNEL_ID}`\nWarn channel: `{WARN_CHANNEL_ID or 'inside the ticket'}`",
+        ephemeral=True)
+
+
 @client.tree.error
 async def on_tree_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     print(f"Command error: {error!r}")
