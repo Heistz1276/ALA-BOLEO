@@ -4,8 +4,9 @@ Watches the backup tickets, reads the "Help Registered" messages, checks every h
 Roblox cookie and posts warnings when a helper never actually joins.
 
   5 min after registering  -> not online on Roblox                 -> warning
-  7 min after registering  -> not in the requested game            -> warning
-  backup result is posted  -> never joined the game                -> warning + red summary embed
+  7 min after registering  -> not in any Roblox game               -> warning
+  backup result is posted  -> never joined a game                  -> warning + red summary embed
+A warning is only given after the bad status was seen twice in a row, and never when Roblox could not be reached.
 
 Requires: discord.py >= 2.6, aiohttp, python-dotenv
 Run:      py main.py
@@ -18,6 +19,7 @@ import re
 import subprocess
 import sys
 import time
+from datetime import datetime
 
 
 def _bootstrap():
@@ -43,6 +45,7 @@ _bootstrap()
 import aiohttp  # noqa: E402
 import discord  # noqa: E402
 from discord import app_commands  # noqa: E402
+from aiohttp import web  # noqa: E402
 from discord.ext import tasks  # noqa: E402
 from dotenv import load_dotenv  # noqa: E402
 
@@ -63,12 +66,12 @@ if ROBLOX_COOKIE.lower().startswith(".roblosecurity="):
     ROBLOX_COOKIE = ROBLOX_COOKIE.split("=", 1)[1]
 
 OWNER_ID = env_int("OWNER_ID")
-# the categories the tickets are made in (comma separated in .env)
-TICKET_CATEGORY_IDS = [int(x) for x in re.findall(r"\d+", os.getenv("TICKET_CATEGORY_IDS", "")
-                       or "1507716131551707258,1570834279242530836")]
-TRACKED_BOT_ID = env_int("TRACKED_BOT_ID", 1470577242676531372)           # the bot whose messages are read
-RESULT_CHANNEL_ID = env_int("RESULT_CHANNEL_ID", 1562782174137159792)     # a result posted here = the backup ended
-WARN_CHANNEL_ID = env_int("WARN_CHANNEL_ID", 1570849070753251348)         # all warnings are posted here (0 = inside the ticket)
+# the IDs are fixed here on purpose, so an old value in .env / Render variables can never override them
+TICKET_CATEGORY_IDS = [1570834279242530836]        # tickets are opened in this category
+TRACKED_BOT_ID = 1470577242676531372               # the bot that posts "Help Registered"
+RESULT_CHANNEL_ID = 1562782174137159792            # a result posted here = the backup ended
+WARN_CHANNEL_ID = 1570849070753251348              # all warnings are posted here
+CATEGORY_TEXT = ", ".join(f"`{i}`" for i in TICKET_CATEGORY_IDS)
 
 OFFLINE_MINUTES = env_int("OFFLINE_MINUTES", 5)
 NOT_JOINED_MINUTES = env_int("NOT_JOINED_MINUTES", 7)
@@ -78,6 +81,11 @@ MAX_TICKET_HOURS = env_int("MAX_TICKET_HOURS", 6)       # a ticket with no resul
 RECOVER_HOURS = env_int("RECOVER_HOURS", 3)             # on start-up only help messages newer than this are picked up
 TICKET_LABEL = os.getenv("TICKET_LABEL", "").strip() or "Backup-ticket"
 BOT_NAME = os.getenv("BOT_NAME", "").strip() or "Cruxer"
+CONFIRM_CHECKS = max(1, env_int("CONFIRM_CHECKS", 2))   # bad checks in a row needed before a timed warning
+END_GRACE_SECONDS = env_int("END_GRACE_SECONDS", 120)   # helpers who registered less than this before the end get no end warning
+DELETE_GRACE_SECONDS = env_int("DELETE_GRACE_SECONDS", 180)   # a deleted ticket still waits this long for its result
+LAST_ONLINE_GRACE = 120                                 # "offline" but seen online in the last 2 min still counts as online
+STRICT_SERVER = os.getenv("STRICT_SERVER", "").strip().lower() in ("1", "true", "yes")   # true = must be in the ticket's own server
 
 YELLOW, RED = 0xF1C40F, 0xE74C3C
 NO_PING = discord.AllowedMentions.none()
@@ -283,7 +291,7 @@ def register_helper(t, uid: int, rb_name, rb_id, when: float) -> bool:
         return False
     t["helpers"][key] = {
         "discord_id": uid, "roblox": rb_name or "unknown", "roblox_id": rb_id, "tries": 0, "t": when,
-        "seen_online": False, "seen_game": False, "w5": False, "w7": False, "wend": False,
+        "seen_online": False, "seen_game": False, "w5": False, "w7": False, "wend": False, "s5": 0, "s7": 0,
     }
     save()
     print(f"[{label(t)}] helper registered: {uid} / {rb_name}")
@@ -301,12 +309,23 @@ def in_requested_server(t, p) -> bool:
     return True
 
 
+def parse_time(text: str) -> float:
+    try:
+        return datetime.fromisoformat(re.sub(r"\.\d+", "", text).replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return 0.0
+
+
 def apply_presence(t, h, p):
     ptype = int(p.get("userPresenceType") or 0)   # 0 offline, 1 online, 2 in game, 3 in studio
     if ptype >= 1:
         h["seen_online"] = True
-    if ptype == 2 and in_requested_server(t, p):
-        h["seen_game"] = True
+    else:
+        last = parse_time(p.get("lastOnline") or "")   # Roblox can lag a minute: a very recent "last online" counts as online
+        if last and time.time() - last < LAST_ONLINE_GRACE:
+            h["seen_online"] = True
+    if ptype == 2 and (not STRICT_SERVER or in_requested_server(t, p)):
+        h["seen_online"] = h["seen_game"] = True   # in any Roblox game
 
 
 # ============================================================ warnings
@@ -337,7 +356,8 @@ async def warn(t, h, reason: str):
 
 
 async def check_helpers(t, helpers, fetched: dict, now: float):
-    """Apply fresh presence, then fire the 5 minute and 7 minute warnings."""
+    """Apply fresh presence, then fire the 5 minute and 7 minute warnings.
+    A warning needs CONFIRM_CHECKS bad checks in a row, so one laggy Roblox answer never warns anybody."""
     for h in helpers:
         p = fetched.get(h["roblox_id"])
         if p is None:
@@ -345,13 +365,21 @@ async def check_helpers(t, helpers, fetched: dict, now: float):
         apply_presence(t, h, p)
         elapsed = now - h["t"]
         if not h["w5"] and elapsed >= OFFLINE_MINUTES * 60:
-            h["w5"] = True
-            if not h["seen_online"]:
-                await warn(t, h, "Offline on Roblox")
+            if h["seen_online"]:
+                h["w5"] = True
+            else:
+                h["s5"] = h.get("s5", 0) + 1
+                if h["s5"] >= CONFIRM_CHECKS:
+                    h["w5"] = True
+                    await warn(t, h, f"Not online on Roblox after {OFFLINE_MINUTES} minutes")
         if not h["w7"] and elapsed >= NOT_JOINED_MINUTES * 60:
-            h["w7"] = True
-            if not h["seen_game"]:
-                await warn(t, h, f"Not in the requested Roblox server after {NOT_JOINED_MINUTES} minutes")
+            if h["seen_game"]:
+                h["w7"] = True
+            else:
+                h["s7"] = h.get("s7", 0) + 1
+                if h["s7"] >= CONFIRM_CHECKS:
+                    h["w7"] = True
+                    await warn(t, h, f"Not in a Roblox game after {NOT_JOINED_MINUTES} minutes")
 
 
 async def resolve_ids(helpers):
@@ -374,8 +402,23 @@ async def end_ticket(t, silent=False):
         pending = [h for h in t["helpers"].values() if not h["seen_game"] and not h["wend"]]
         await resolve_ids(pending)
         ids = [h["roblox_id"] for h in pending if h["roblox_id"]]
-        fetched = await client.roblox.presence(ids) if ids else {}
-        if fetched:
+        fetched = {}
+        if ids:
+            for _ in range(3):
+                fetched = await client.roblox.presence(ids)
+                if fetched is not None:
+                    break
+                await asyncio.sleep(3)
+            if fetched is None:   # Roblox / the cookie failed: never punish anybody for that
+                print(f"[{label(t)}] Roblox could not be reached at the end, no warnings given")
+                embed = discord.Embed(
+                    title=f"Helper check skipped - {label(t)}",
+                    description="Roblox could not be reached when this backup ended, so nobody was warned.",
+                    colour=0x95A5A6)
+                embed.set_footer(text=BOT_NAME)
+                await post_embed(t, embed)
+                save()
+                return
             for h in pending:
                 p = fetched.get(h["roblox_id"])
                 if p:
@@ -384,11 +427,14 @@ async def end_ticket(t, silent=False):
         for h in pending:
             if h["seen_game"]:
                 continue
-            if not h["roblox_id"]:
+            if not h["roblox_id"] or h["roblox_id"] not in fetched:
                 print(f"[{label(t)}] could not check {h['roblox']} (unknown Roblox user), no warning given")
                 continue
+            if t["ended_at"] - h["t"] < END_GRACE_SECONDS:
+                print(f"[{label(t)}] {h['roblox']} registered just before the end, no warning given")
+                continue
             h["wend"] = True
-            reason = "Ticket ended before joining the requested Roblox server"
+            reason = "Backup ended and the helper was never in a Roblox game"
             if not h["seen_online"]:
                 reason += " (offline)"
             await warn(t, h, reason)
@@ -397,8 +443,7 @@ async def end_ticket(t, silent=False):
             lines = []
             for h in offenders:
                 who = f"[{h['roblox']}](https://www.roblox.com/users/{h['roblox_id']}/profile)"
-                state_text = "was online, but not in the requested server" if h["seen_online"] \
-                    else "was offline, not in the requested server"
+                state_text = "was online, but not in a game" if h["seen_online"] else "was offline, not in a game"
                 lines.append(f"• <@{h['discord_id']}> – {who} {state_text}")
             embed = discord.Embed(
                 title=f"Offline Helper Warning - {label(t)}",
@@ -424,6 +469,10 @@ async def poll_loop():
                     continue
                 if now - t["created"] > MAX_TICKET_HOURS * 3600:
                     t["ended"], t["ended_at"] = True, now
+                    continue
+                if t.get("deleted_at"):   # channel is gone: no new timed warnings, only wait for the result
+                    if now - t["deleted_at"] > DELETE_GRACE_SECONDS:
+                        t["ended"], t["ended_at"] = True, now
                     continue
                 pend = [h for h in t["helpers"].values() if not h["seen_game"] and not h["wend"]]
                 if pend:
@@ -477,11 +526,32 @@ async def handle_message(message: discord.Message):
     elif chan.id == RESULT_CHANNEL_ID and tracked:
         text = message_text(message)
         t = find_ticket(text)
+        if t and message.created_at.timestamp() < t["created"]:
+            t = None   # a result older than the ticket cannot be its result
         if t:
             print(f"Result posted for {label(t)}, ending it.")
             await end_ticket(t)
         else:
             print(f"A result was posted but no open ticket matched it: {text[:150]!r}")
+
+
+async def start_web():
+    """Tiny web page so Render sees an open port and cron-job.org has something to ping."""
+    port = os.getenv("PORT", "").strip()
+    if not port:
+        return None
+
+    async def ok(request):
+        return web.Response(text="Cruxer is running")
+
+    app = web.Application()
+    app.router.add_get("/", ok)
+    app.router.add_get("/health", ok)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    await web.TCPSite(runner, "0.0.0.0", int(port)).start()
+    print(f"Web page listening on port {port}")
+    return runner
 
 
 class Cruxer(discord.Client):
@@ -492,17 +562,24 @@ class Cruxer(discord.Client):
         self.tree = app_commands.CommandTree(self)
         self.session = None
         self.roblox = None
+        self.web = None
         self._ready_once = False
 
     async def setup_hook(self):
         self.session = aiohttp.ClientSession(cookie_jar=aiohttp.DummyCookieJar())
         self.roblox = Roblox(self.session)
         try:
+            self.web = await start_web()
+        except Exception as exc:
+            print(f"Could not start the web page: {exc!r}")
+        try:
             await self.tree.sync()
         except discord.HTTPException as exc:
             print(f"Could not sync slash commands: {exc!r}")
 
     async def close(self):
+        if self.web:
+            await self.web.cleanup()
         if self.session:
             await self.session.close()
         await super().close()
@@ -538,8 +615,9 @@ class Cruxer(discord.Client):
 
     async def on_guild_channel_delete(self, channel):
         t = state["tickets"].get(str(channel.id))
-        if t and not t["ended"]:   # a deleted ticket is over, no end-of-backup warnings
-            await end_ticket(t, silent=True)
+        if t and not t["ended"]:   # the result may still arrive after the delete, so wait for it a bit
+            t["deleted_at"] = time.time()
+            save()
 
 
 client = Cruxer()
@@ -579,7 +657,14 @@ async def recover():
                     learn_server(t, text)
                     reg = parse_help(text) if m.author.id == TRACKED_BOT_ID else None
                     if reg and m.created_at.timestamp() >= cutoff:
-                        found += register_helper(t, reg[0], reg[1], reg[2], m.created_at.timestamp())
+                        if register_helper(t, reg[0], reg[1], reg[2], m.created_at.timestamp()):
+                            found += 1
+                            hh, age = t["helpers"][str(reg[0])], time.time() - m.created_at.timestamp()
+                            # these windows passed while the bot was off, they may already have been warned
+                            if age > OFFLINE_MINUTES * 60 + 120:
+                                hh["w5"] = True
+                            if age > NOT_JOINED_MINUTES * 60 + 120:
+                                hh["w7"] = True
         except discord.HTTPException as exc:
             print(f"Could not read {chan.name}: {exc!r}")
     print(f"Recovery done: {len(state['tickets'])} tickets known, {found} helpers picked up.")
@@ -829,7 +914,9 @@ async def config_cmd(interaction: discord.Interaction):
     await interaction.response.send_message(
         f"Offline warning: `{OFFLINE_MINUTES}` min\nNot-in-game warning: `{NOT_JOINED_MINUTES}` min\n"
         f"Warning limit: `{MAX_WARNINGS}`\nPoll every: `{POLL_SECONDS}`s\n"
-        f"Ticket categories: {", ".join(f"`{i}`" for i in TICKET_CATEGORY_IDS)}\nTracked bot: `{TRACKED_BOT_ID}`\n"
+        f"Confirm checks: `{CONFIRM_CHECKS}`\nEnd grace: `{END_GRACE_SECONDS}`s\n"
+        f"Strict server match: `{STRICT_SERVER}`\n"
+        f"Ticket categories: {CATEGORY_TEXT}\nTracked bot: `{TRACKED_BOT_ID}`\n"
         f"Result channel: `{RESULT_CHANNEL_ID}`\nWarn channel: `{WARN_CHANNEL_ID or 'inside the ticket'}`",
         ephemeral=True)
 
